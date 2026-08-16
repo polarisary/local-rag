@@ -1,5 +1,6 @@
+import logging
 import os
-import time
+import re
 from typing import Any, Dict, List
 
 from dotenv import load_dotenv
@@ -9,54 +10,15 @@ from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 _LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.deepseek.com/v1")
 _LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 _LLM_MODEL = os.getenv("LLM_MODEL", "deepseek-chat")
+_LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "180"))
 _EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3-embedding")
 
 _embedding_singleton = None
-
-
-_HF_ENDPOINTS = [ep for ep in [
-    os.getenv("HF_ENDPOINT"),
-    "https://hf-mirror.com",
-    "https://huggingface.co",
-] if ep]
-
-
-def _dedupe_endpoints(endpoints):
-    seen = set()
-    result = []
-    for ep in endpoints:
-        key = ep.rstrip("/")
-        if key not in seen:
-            seen.add(key)
-            result.append(ep)
-    return result
-
-
-def _apply_hf_endpoint(endpoint: str, modules_to_clear=None) -> str:
-    """Set HF endpoint to env + all huggingface* modules. Returns previous env value."""
-    if modules_to_clear is None:
-        modules_to_clear = [
-            "huggingface_hub",
-            "huggingface_hub.constants",
-            "transformers",
-            "transformers.utils.hub",
-            "sentence_transformers",
-            "llama_index.embeddings.huggingface",
-        ]
-    import sys as _sys
-
-    for mod in modules_to_clear:
-        _sys.modules.pop(mod, None)
-
-    os.environ["HF_ENDPOINT"] = endpoint
-    # re-import and patch constants immediately
-    from huggingface_hub import constants as hf_constants
-
-    hf_constants.ENDPOINT = endpoint.rstrip("/")
-    return os.environ.get("HF_ENDPOINT")
 
 
 def _try_load_embedding(model_name: str) -> BaseEmbedding:
@@ -68,27 +30,22 @@ def _try_load_embedding(model_name: str) -> BaseEmbedding:
     except Exception:
         pass
 
-    # 2) 在线加载，按端点依次尝试
-    last_exc = None
-    tried = []
-    for endpoint in _dedupe_endpoints(_HF_ENDPOINTS):
-        tried.append(endpoint)
-        os.environ["HF_ENDPOINT"] = endpoint
-        try:
-            from huggingface_hub import constants as hf_constants
+    # 2) 在线加载
+    endpoint = os.getenv("HF_ENDPOINT", "https://huggingface.co")
+    os.environ["HF_ENDPOINT"] = endpoint
+    try:
+        from huggingface_hub import constants as hf_constants
 
-            hf_constants.ENDPOINT = endpoint.rstrip("/")
-        except Exception:
-            pass
-        try:
-            return HuggingFaceEmbedding(model_name=model_name)
-        except Exception as exc:
-            last_exc = exc
-            time.sleep(3)
-    raise RuntimeError(
-        f"Failed to download embedding model {model_name} "
-        f"after trying endpoints {tried}: {last_exc}"
-    )
+        hf_constants.ENDPOINT = endpoint.rstrip("/")
+    except Exception:
+        pass
+    try:
+        return HuggingFaceEmbedding(model_name=model_name)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to load embedding model {model_name} "
+            f"via {endpoint}: {exc}"
+        ) from exc
 
 
 RAG_PROMPT_TMPL = PromptTemplate(
@@ -103,19 +60,26 @@ RAG_PROMPT_TMPL = PromptTemplate(
 
 def _call_llm(prompt: str) -> str:
     """用 openai SDK 直接调用 chat completions API，绕过 OpenAILike 的请求构造问题。"""
-    from openai import OpenAI
+    from openai import OpenAI, APITimeoutError, APIConnectionError
 
-    client = OpenAI(api_key=_LLM_API_KEY, base_url=_LLM_BASE_URL)
-    resp = client.chat.completions.create(
-        model=_LLM_MODEL,
-        messages=[
-            {"role": "system", "content": "你是企业知识库助手，基于参考文档回答问题。"},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.7,
-        max_tokens=1024,
-    )
-    return resp.choices[0].message.content or ""
+    client = OpenAI(api_key=_LLM_API_KEY, base_url=_LLM_BASE_URL, timeout=_LLM_TIMEOUT)
+    try:
+        resp = client.chat.completions.create(
+            model=_LLM_MODEL,
+            messages=[
+                {"role": "system", "content": "你是企业知识库助手，基于参考文档回答问题。"},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.7,
+            max_tokens=1024,
+        )
+        return resp.choices[0].message.content or ""
+    except APITimeoutError as e:
+        logger.error(f"LLM 调用超时 ({_LLM_TIMEOUT}s): {e}")
+        raise RuntimeError(f"LLM 调用超时，请稍后重试或增大 LLM_TIMEOUT 配置") from e
+    except APIConnectionError as e:
+        logger.error(f"LLM 连接失败: {e}")
+        raise RuntimeError(f"LLM 服务连接失败，请检查 LLM_BASE_URL/LLM_API_KEY 配置") from e
 
 
 def get_embedding() -> BaseEmbedding:
@@ -140,23 +104,24 @@ def _build_context(nodes) -> str:
 
 
 def _collect_references(nodes) -> List[Dict[str, Any]]:
-    seen = set()
-    refs: List[Dict[str, Any]] = []
+    """按文件名去重，并收集同一文件涉及的所有页码，用于合并展示。"""
+    file_pages: Dict[str, set] = {}
     for node in nodes:
         meta = node.metadata or {}
         fn = meta.get("file_name", "unknown")
         pn = meta.get("page_number")
-        key = (fn, pn)
-        if key in seen:
-            continue
-        seen.add(key)
-        refs.append({"file_name": fn, "page_number": pn})
+        if fn not in file_pages:
+            file_pages[fn] = set()
+        if pn is not None:
+            file_pages[fn].add(pn)
+    refs = []
+    for fn, pages in file_pages.items():
+        refs.append({"file_name": fn, "pages": sorted(pages) if pages else []})
     return refs
 
 
 def _strip_llm_references(text: str) -> str:
     """清理 LLM 回答中自带的引用来源部分，统一由代码附加。"""
-    import re
     # 匹配末尾的"引用来源：..."、"引用：..."、"References:..."等整段
     text = re.sub(
         r"\n*(?:引用来源|引用|参考资料|References?|Source[s]?)[：:].*",
@@ -167,23 +132,55 @@ def _strip_llm_references(text: str) -> str:
     return text.strip()
 
 
-def query_rag(user_query: str) -> Dict[str, Any]:
+def _is_no_info_answer(answer: str) -> bool:
+    """识别 LLM 回答是否表示"知识库没有相关信息"。
+
+    当 LLM 判断参考文档无法回答用户问题时，会返回类似"没有相关信息"、
+    "知识库中没有"、"未找到相关内容"等措辞。此时不应展示引用来源，
+    因为引用的文档实际上与问题无关。
+    """
+    patterns = [
+        r"没有相关(信息|内容|答案|资料)",
+        r"知识库(中)?没有",
+        r"未(找到|发现|包含|涉及)相关",
+        r"无法(从|在).{0,10}(参考文档|知识库|文档).{0,10}(找到|找到答案|回答)",
+        r"文档(中)?(未|没有|无法).{0,10}(提供|包含|涉及|提到|回答)",
+        r"不(在|属于).{0,10}(知识库|参考文档|文档).{0,10}(范围|内容)",
+        r"(没有|未)在.{0,10}(参考文档|知识库|文档).{0,10}(中)?(找到|提及|涉及|说明|回答)",
+        r"参考文档(中)?(没有|未|无法).{0,10}(提供|找到|包含|涉及|回答)",
+        r"no (relevant )?information",
+        r"not (found|covered|mentioned|available) (in|in the) (knowledge base|document|reference)",
+        r"cannot (find|answer|provide) (any |relevant )?(information|answer)",
+    ]
+    for p in patterns:
+        if re.search(p, answer, flags=re.IGNORECASE):
+            return True
+    return False
+
+
+def query_rag(user_query: str, top_k: int = None) -> Dict[str, Any]:
     from src.rag.retriever import retrieve
 
-    nodes = retrieve(user_query, top_k=4)
+    nodes = retrieve(user_query, top_k=top_k)
     context_str = _build_context(nodes)
     refs = _collect_references(nodes)
 
     prompt = RAG_PROMPT_TMPL.format(context_str=context_str, user_query=user_query)
     answer = _strip_llm_references(_call_llm(prompt))
 
-    if refs:
+    # 如果 LLM 判断"没有相关信息"，不展示引用来源（因为引用的文档实际无关）
+    if refs and not _is_no_info_answer(answer):
         ref_lines = []
-        for i, r in enumerate(refs, start=1):
-            if r["page_number"] is None:
-                ref_lines.append(f"- {r['file_name']}")
+        for r in refs:
+            fn = r["file_name"]
+            pages = r.get("pages", [])
+            if pages:
+                ref_lines.append(f"- {fn} (p.{', p.'.join(str(p) for p in pages)})")
             else:
-                ref_lines.append(f"- {r['file_name']} (p.{r['page_number']})")
+                ref_lines.append(f"- {fn}")
         answer += "\n\n**引用来源：**\n" + "\n".join(ref_lines)
+    elif _is_no_info_answer(answer):
+        # 无相关信息时清空 references，保持 API 返回一致性
+        refs = []
 
     return {"answer": answer, "references": refs}

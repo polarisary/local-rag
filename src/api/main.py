@@ -1,3 +1,4 @@
+import logging
 import os
 import time
 import uuid
@@ -9,6 +10,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Enterprise Local RAG API", version="0.1.0")
 
@@ -50,7 +57,11 @@ def ingest(req: IngestRequest):
     folder = req.folder_path or os.getenv("INGEST_FOLDER", "/app/test_data")
     try:
         stats = run_folder_ingest(folder)
+    except FileNotFoundError as e:
+        logger.error(f"ingest 文件夹不存在: {e}")
+        raise HTTPException(status_code=404, detail=f"folder not found: {e}")
     except Exception as e:
+        logger.exception("ingest failed")
         raise HTTPException(status_code=500, detail=f"ingest failed: {e}")
     return {"code": 0, "msg": "ingest finished", "data": stats}
 
@@ -73,7 +84,7 @@ def list_models():
 
 class RagQueryRequest(BaseModel):
     query: str
-    top_k: Optional[int] = 4
+    top_k: Optional[int] = None
 
 
 @app.post("/api/v1/rag/query")
@@ -83,8 +94,9 @@ def rag_query(req: RagQueryRequest):
     if not req.query or not req.query.strip():
         raise HTTPException(status_code=400, detail="query is required")
     try:
-        result = query_rag(req.query)
+        result = query_rag(req.query, top_k=req.top_k)
     except Exception as e:
+        logger.exception("rag query failed")
         raise HTTPException(status_code=500, detail=f"rag failed: {e}")
     return {"code": 0, "msg": "ok", "data": result}
 
@@ -101,6 +113,7 @@ def chat_completions(req: ChatCompletionRequest):
     try:
         result = query_rag(user_query)
     except Exception as e:
+        logger.exception("chat completions failed")
         raise HTTPException(status_code=500, detail=f"rag failed: {e}")
 
     answer = result.get("answer", "")

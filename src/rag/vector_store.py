@@ -1,3 +1,4 @@
+import logging
 import os
 from typing import List
 
@@ -7,6 +8,8 @@ from llama_index.vector_stores.milvus import MilvusVectorStore
 from pymilvus import utility, connections
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 _MILVUS_HOST = os.getenv("MILVUS_HOST", "localhost")
 _MILVUS_PORT = int(os.getenv("MILVUS_PORT", "19530"))
@@ -23,8 +26,10 @@ def _connect_once():
             host=_MILVUS_HOST,
             port=_MILVUS_PORT,
         )
-    except Exception:
-        pass
+        logger.info(f"Milvus 连接成功: {_MILVUS_HOST}:{_MILVUS_PORT}")
+    except Exception as e:
+        logger.error(f"Milvus 连接失败 {_MILVUS_HOST}:{_MILVUS_PORT}: {e}")
+        raise
 
 
 def get_vector_store() -> MilvusVectorStore:

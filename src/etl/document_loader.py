@@ -1,8 +1,11 @@
+import logging
 import os
 from pathlib import Path
 from typing import List
 
 from llama_index.core.schema import Document
+
+logger = logging.getLogger(__name__)
 
 
 def _is_ignored(path: Path) -> bool:
@@ -22,14 +25,25 @@ def _is_supported(path: Path) -> bool:
 
 
 def _extract_pdf(file_path: Path) -> List[Document]:
+    """提取 PDF 文本，按页生成 Document。
+
+    跨页 overlap：每页文本前面追加上一页末尾的 N 字符，
+    防止跨页信息（如"工作单位"在 p.2 末尾、"工作内容"在 p.3 开头）
+    被切到不同 chunk 导致检索丢失上下文。
+    """
     import fitz
 
+    _PAGE_OVERLAP_CHARS = 300
     docs: List[Document] = []
+    prev_tail = ""
     with fitz.open(str(file_path)) as pdf:
         for page_idx, page in enumerate(pdf, start=1):
             text = page.get_text("text") or ""
             if not text.strip():
                 continue
+            # 前面追加上一页末尾内容，保证跨页上下文连续
+            if prev_tail:
+                text = prev_tail + "\n" + text
             docs.append(
                 Document(
                     text=text,
@@ -40,6 +54,8 @@ def _extract_pdf(file_path: Path) -> List[Document]:
                     },
                 )
             )
+            # 保存本页末尾 N 字符供下一页使用
+            prev_tail = text[-_PAGE_OVERLAP_CHARS:] if len(text) > _PAGE_OVERLAP_CHARS else text
     return docs
 
 
@@ -105,6 +121,6 @@ def load_documents_from_folder(folder_path: str) -> List[Document]:
                     docs = _extract_docx_pptx(fpath)
                 all_docs.extend(docs)
             except Exception as e:
-                print(f"[WARN] Failed to parse {fpath}: {e}")
+                logger.warning(f"解析文件失败 {fpath}: {e}")
                 continue
     return all_docs
