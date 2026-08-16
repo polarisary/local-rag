@@ -1,0 +1,19 @@
+# Secrets & env
+.env
+
+# OS
+.DS_Store
+
+# IDE
+.idea/
+.trae/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+
+# Data (optional: uncomment if test_data should not be tracked)
+# test_data/

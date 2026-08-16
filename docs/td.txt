@@ -1,0 +1,190 @@
+Tech Design：Enterprise‑Local‑RAG 第一周实现
+目标：完成第一周最小可用版本，Coding Agent 可直接依据本文档编码。
+阶段范围：本地文档 RAG 最小闭环；不做增量更新、不做飞书同步、不做多租户；仅实现批量导入本地文档文件夹 → 解析分块 → Milvus 入库 → RAG 问答 → 溯源输出；对接 Open‑WebUI 作为前端。
+后续第 2‑4 周不在本 Design 范围内。
+1. Overview
+1.1 背景与目标
+构建企业私有知识库 RAG 最小可运行 Demo，用于副业作品集。
+第一周只完成端到端基础链路：
+读取本地目录下 PDF / DOCX / PPTX
+文档解析、提取文本 + 页码元数据
+分块，存入 Milvus 向量库
+FastAPI 提供入库、问答接口
+RAG 检索 + LLM 生成回答，输出文档溯源（文件名、页码）
+对接 Open‑WebUI 作为前端交互层
+Docker Compose 可一键启动整套环境
+非目标（第一周不实现）
+文件增量监控、hash 变更检测
+BM25、Reranker 重排
+OCR 扫描 PDF
+权限、多租户
+飞书 / 钉钉 API
+GraphRAG
+复杂后台管理页面
+1.2 技术栈
+表格
+Layer	Component	Purpose
+Document Parse	PyMuPDF, unstructured‑io, python‑docx	PDF/DOCX/PPTX 解析，提取页码元数据
+RAG Framework	llama‑index 0.11.x	Document Node、Chunk、Metadata 管理
+Vector DB	Milvus standalone(docker)	向量存储与向量检索
+LLM	LLM API(Qwen‑2 / DeepSeek)	生成回答；第一周优先 API 模式
+Backend API	FastAPI	入库触发接口、RAG 问答接口
+Embedding	BGE‑M3‑Embedding	向量化
+Frontend	Open‑WebUI(docker)	UI，对接 FastAPI 自定义 OpenAI 兼容接口
+Deploy	Docker Compose	编排 Milvus、FastAPI、Open‑WebUI
+复用开源组件：
+参考 Pibrary 的元数据、溯源输出逻辑，不直接复制业务代码；
+LlamaIndex 官方示例做 Node 构建、向量库接入；
+MinerU 暂时不引入，第一周用 unstructured+PyMuPDF 做基础解析。
+2. System Architecture
+plaintext
+[Local Document Folder]
+        ↓
+Document Loader(PyMuPDF/unstructured) → build LlamaIndex Node(with metadata: file_name, page_number)
+        ↓
+Chunker(SentenceSplitter)
+        ↓
+Embedding(BGE‑M3)
+        ↓
+Milvus Vector Store
+        ↓
+FastAPI Service
+    ├─ /api/v1/ingest  # 触发文件夹批量入库
+    └─ /api/v1/chat/completions # OpenAI兼容接口，供Open‑WebUI调用
+        ↓
+Open‑WebUI(frontend)
+核心约定：
+每个 Node 必须携带元数据：file_name, page_number, source_path
+问答返回 LLM 回答 + 引用的元数据列表（溯源）
+3. Module Design
+3.1 src.etl 文档解析模块
+3.1.1 document_loader.py
+输入：本地文件夹路径
+输出：List[llama_index.core.schema.Document]，每个 Document 携带 metadata
+.pdf：优先 PyMuPDF，循环每一页，按页构建 Document，metadata 写入page_number
+.docx/.pptx：unstructured‑io 解析，page_number 填None
+过滤空文档、全空白页面
+跳过隐藏文件、.git、临时文件
+第一周不处理扫描件 OCR。
+3.1.2 chunker.py
+使用 LlamaIndex SentenceSplitter
+参数：chunk_size=512, chunk_overlap=80
+保留原始 Document 的 metadata 向下透传到子 Node；保证每个 chunk 可以追溯文件名 + 页码。
+3.1.3 pipeline.py
+入口函数：run_folder_ingest(folder_path: str)
+流程：
+遍历文件夹，调用 document_loader 得到 Document 列表
+chunker 切分为 Node 列表
+调用向量存储写入 Milvus
+第一周：每次调用执行全量覆盖写入；不做增量、不做去重。
+3.2 src.rag RAG 核心模块
+3.2.1 vector_store.py
+封装 Milvus 对接（LlamaIndex MilvusVectorStore）
+Collection Name：enterprise_rag_demo
+初始化：如 collection 不存在则创建；第一周简单实现：ingest 前清空 collection（全量重写）
+第一周简化：每次 ingest 清空集合，适合 Demo，不用于生产。
+3.2.2 retriever.py
+Retriever：Vector Retriever，top_k=4
+返回：List[Node]，携带完整 metadata
+3.2.3 llm_chain.py
+输入：user_query
+输出：answer + reference_list
+retriever 获取相关 nodes
+构造 RAG Prompt 模板：
+plaintext
+你是企业知识库助手，基于下面参考文档回答用户问题。
+如果文档没有答案，直接说明知识库没有相关信息，不要编造。
+
+【参考文档】
+{context_str}
+
+用户问题：{user_query}
+
+回答后列出引用来源：文件名、页码。
+调用外部 LLM API；组装返回：answer 文本 + references 数组 [{"file_name":"xxx.pdf","page_number":xx}]
+3.3 src.api FastAPI 接口层 main.py
+接口 1：触发批量入库
+plaintext
+POST /api/v1/ingest
+Body: {"folder_path":"/app/test_data"}
+Response: {"code":0,"msg":"ingest started"}
+第一周简化：同步执行（Demo 用，不做异步任务队列）
+接口 2：兼容 OpenAI ChatCompletion（供 Open‑WebUI 对接）
+POST /api/v1/chat/completions
+兼容 OpenAI 请求格式；内部调用 rag 链路；返回 choices，同时把溯源信息放在extra自定义字段返回。
+Open‑WebUI 配置：自定义 OpenAI 后端，指向 http://fastapi:8000/api/v1
+3.4 Configuration
+所有配置使用环境变量，不硬编码。.env.example
+plaintext
+# Milvus
+MILVUS_HOST=milvus
+MILVUS_PORT=19530
+MILVUS_COLLECTION=enterprise_rag_demo
+
+# LLM
+LLM_BASE_URL=https://api.deepseek.com/v1
+LLM_API_KEY=sk‑xxx
+LLM_MODEL=deepseek‑chat
+
+# Embedding
+EMBEDDING_MODEL=BAAI/bge‑m3‑embedding
+
+# App
+APP_PORT=8000
+INGEST_FOLDER=/app/test_data
+4. Project Structure（Coding Agent 直接参考）
+plaintext
+enterprise‑local‑rag/
+├── docker‑compose.yml
+├── .env.example
+├── requirements.txt
+├── test_data/          # 放置测试PDF/docx
+├── src/
+│   ├── etl/
+│   │   ├── __init__.py
+│   │   ├── document_loader.py
+│   │   ├── chunker.py
+│   │   └── pipeline.py
+│   ├── rag/
+│   │   ├── __init__.py
+│   │   ├── vector_store.py
+│   │   ├── retriever.py
+│   │   └── llm_chain.py
+│   ├── api/
+│   │   ├── __init__.py
+│   │   └── main.py          # FastAPI入口
+│   └── utils/
+│       └── __init__.py
+└── docs/
+    └── deploy_week1.md      # 第一周部署文档
+5. Docker Compose 设计（docker‑compose.yml）
+3 个 service：
+milvus：官方 milvus standalone 镜像
+fastapi：本项目 Python 服务；挂载本地test_data目录到容器内/app/test_data
+open‑webui：官方镜像；配置 OPENAI_API_BASE 指向 fastapi 服务；不需要真实 openai key
+网络：同一 docker bridge 网络，服务间用 service name 做 hostname 访问。
+6. Acceptance Criteria（第一周验收标准）
+将若干 PDF/DOCX 放入test_data文件夹；调用/api/v1/ingest接口完成入库。
+在 Open‑WebUI 界面提问，可基于文档内容回答。
+回答输出溯源：输出引用的文件名与页码。
+没有文档信息时，模型不会编造幻觉答案。
+使用docker‑compose up一键拉起全部服务，无需本地安装 Python 环境。
+.env.example所有关键参数外部可配置，无硬编码密钥。
+不在第一周验收
+增量更新、文件变更检测
+BM25、Reranker
+OCR 扫描件
+异步任务、任务状态查询
+权限、多租户
+7. Risk & Limitation
+当前是全量重写入库：每次 ingest 清空 Milvus 集合，适合 Demo，不可直接上生产。
+只支持原生可复制文本 PDF；扫描版 PDF 识别不出（第二周处理）。
+LLM 依赖外部 API，离线本地模型不在第一周范围。
+没有做请求限流、鉴权，仅用于 Demo 演示，不能直接交付客户。
+8. Next Phase Todo（仅记录，第一周不实现）
+ETL：文件 md5 hash，增量更新、删除失效向量
+OCR 支持扫描 PDF
+BM25 + Reranker 重排
+异步 ingest 任务，任务状态查询接口
+增加日志输出
+接入飞书 Wiki 同步模块
