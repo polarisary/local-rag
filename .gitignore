@@ -15,5 +15,5 @@ __pycache__/
 .pytest_cache/
 .venv/
 
-# Data (optional: uncomment if test_data should not be tracked)
-# test_data/
+# Data (test data contains personal info & third-party materials, keep local only)
+test_data/
